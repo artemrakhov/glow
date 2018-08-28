@@ -132,6 +132,13 @@ bool caffe2ModelLoader::getBroadcast(const ArgumentDictionaryTy &dict) {
   return dict.count("broadcast") && (loadInt(dict.at("broadcast")) == 1);
 }
 
+void writeProtoFile(const caffe2::NetDef &net, const std::string &filename) {
+  std::string binaryFilename = filename;
+  binaryFilename.erase(binaryFilename.size() - 3);
+  std::ofstream ff(binaryFilename, std::ios::out | std::ios::binary);
+  net.SerializeToOstream(&ff);
+}
+
 void caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
   ArgumentDictionaryTy dict = loadArgumentMap(op);
   const std::string &typeName = op.type();
@@ -539,8 +546,8 @@ void caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
 
   if (typeName == "ConstantFill" || typeName == "GivenTensorIntFill" ||
       typeName == "GivenTensorInt64Fill") {
-    loadWeight(op);
-    return;
+    //loadWeight(op);
+    GLOW_ASSERT(false);
   }
 
   if (typeName == "SigmoidCrossEntropyWithLogits") {
@@ -580,7 +587,7 @@ void caffe2ModelLoader::loadNetwork(caffe2::NetDef &net) {
   }
 }
 
-void caffe2ModelLoader::loadWeight(const caffe2::OperatorDef &op) {
+void caffe2ModelLoader::loadWeight(caffe2::OperatorDef &op) {
   ArgumentDictionaryTy dict = loadArgumentMap(op);
   const std::string &typeName = op.type();
 
@@ -725,9 +732,21 @@ void caffe2ModelLoader::loadWeight(const caffe2::OperatorDef &op) {
     tensors_[name] = T;
     auto dim = getShape(dict["shape"]);
     T->reset(ElemKind::FloatTy, dim);
-    auto TH = T->getHandle<>();
     float tensorMin = loadFloat(dict["min"]);
     float tensorMax = loadFloat(dict["max"]);
+
+    for (auto it = op.mutable_arg()->begin(); it != op.mutable_arg()->end(); ) {
+      if (it->name() == "min" || it->name() == "max") {
+        it = op.mutable_arg()->erase(it);
+      } else {
+        it++;
+      }
+    }
+
+    op.set_type("GivenTensorFill");
+
+    auto* vals = op.add_arg();
+    vals->set_name("values");
 
 #ifndef NDEBUG
     llvm::outs() << "The model contains UniformFill operator, which generates"
@@ -735,16 +754,17 @@ void caffe2ModelLoader::loadWeight(const caffe2::OperatorDef &op) {
 #endif // NDEBUG
     // Uniformly generate random numbers in [tensorMin; tensorMax).
     for (size_t i = 0, e = T->size(); i != e; i++) {
-      TH.raw(i) = G_.getParent()->getPRNG().nextRandReal(tensorMin, tensorMax);
+      float rnd = G_.getParent()->getPRNG().nextRandReal(tensorMin, tensorMax);
+      vals->add_floats(rnd);
     }
-    return;
+    return loadWeight(op);
   }
 
   unexpectedNodeError(op, "Unsupported weight kind");
 }
 
 void caffe2ModelLoader::loadWeights(caffe2::NetDef &net) {
-  for (auto &op : net.op()) {
+  for (auto &op : *net.mutable_op()) {
     loadWeight(op);
   }
 }
@@ -763,5 +783,6 @@ caffe2ModelLoader::caffe2ModelLoader(const std::string &netDescFilename,
   loadProtoFile(networkDef, netDescFilename);
   loadProtoFile(weightsDef, netWeightFilename);
   loadWeights(weightsDef);
+  writeProtoFile(weightsDef, netWeightFilename);
   loadNetwork(networkDef);
 }
