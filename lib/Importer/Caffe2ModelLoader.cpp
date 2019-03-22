@@ -206,6 +206,8 @@ bool Caffe2ModelLoader::hasMultidirectionalBroadcast(
   return false;
 }
 
+std::unordered_map<std::string, Tensor> toOverwrite;
+
 void quantizeWeights(const std::string &name, Tensor &T, ElemKind qTy) {
   llvm::outs() << "The model contains FP weights '" << name << "' used in "
                 << "IntQ operator, which were quantized on the fly.\n";
@@ -215,7 +217,58 @@ void quantizeWeights(const std::string &name, Tensor &T, ElemKind qTy) {
       TH.raw(minMaxIds.first), TH.raw(minMaxIds.second));
   auto TQ = quantization::quantizeTensor(T, TQP, qTy);
   T.assign(&TQ);
+  toOverwrite[name].assign(&T);
 }
+
+void writeProtoFile(const caffe2::NetDef &net, const std::string &filename) {
+  std::string binaryFilename = filename;
+  std::ofstream ff(binaryFilename, std::ios::out | std::ios::binary);
+  net.SerializeToOstream(&ff);
+}
+
+void overwriteWeights(caffe2::NetDef &weightsDef) {
+  for (auto &op : *weightsDef.mutable_op()) {
+    auto found = toOverwrite.find(op.output(0));
+    if (found == toOverwrite.end())
+      continue;
+
+    const Tensor& T = found->second;
+
+    auto values = op.mutable_arg()->begin();
+    while (values->name() != "values")
+      values++;
+    values->clear_floats();
+
+    if (T.getType().getElementType() == ElemKind::Int8QTy) {
+      op.set_type("Int8GivenTensorFill");
+      auto TH = T.getHandle<int8_t>();
+      std::string str(TH.size(), '0');
+      for (size_t i = 0; i < TH.size(); i++) {
+        str[i] = (uint8_t)(TH.raw(i) + OFFSETSHIFT);
+      }
+      values->set_s(str);
+
+      auto* arg = op.add_arg();
+      arg->set_name("Y_zero_point");
+      arg->set_i(T.getType().getOffset() + OFFSETSHIFT);
+    } else {
+      op.set_type("Int8GivenIntTensorFill");
+      auto TH = T.getHandle<int32_t>();
+      for (size_t i = 0; i < TH.size(); i++) {
+        values->add_ints(TH.raw(i));
+      }
+
+      auto* arg = op.add_arg();
+      arg->set_name("Y_zero_point");
+      arg->set_i(T.getType().getOffset());
+    }
+
+    auto* arg = op.add_arg();
+    arg->set_name("Y_scale");
+    arg->set_f(T.getType().getScale());
+  }
+}
+
 
 llvm::Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
   ArgumentDictionaryTy dict = loadArgumentMap(op);
@@ -1453,6 +1506,9 @@ Caffe2ModelLoader::Caffe2ModelLoader(const std::string &netDescFilename,
 
     RETURN_IF_ERR(loadWeightsFromNet(weightsDef));
     RETURN_IF_ERR(loadNetwork(networkDef));
+
+    overwriteWeights(weightsDef);
+    writeProtoFile(weightsDef, netWeightFilename + "_new");
 
     RETURN_ERR_IF_NOT(F.verify(), "Function verification failed.");
 
