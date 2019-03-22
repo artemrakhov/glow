@@ -18,6 +18,7 @@
 #include "glow/Base/Tensor.h"
 #include "glow/Graph/Graph.h"
 #include "glow/Graph/Nodes.h"
+#include "glow/Quantization/Base/Base.h"
 #include "glow/Support/Error.h"
 
 #include "llvm/Support/Casting.h"
@@ -205,6 +206,17 @@ bool Caffe2ModelLoader::hasMultidirectionalBroadcast(
   return false;
 }
 
+void quantizeWeights(const std::string &name, Tensor &T, ElemKind qTy) {
+  llvm::outs() << "The model contains FP weights '" << name << "' used in "
+                << "IntQ operator, which were quantized on the fly.\n";
+  auto TH = T.getHandle<float>();
+  auto minMaxIds = TH.minMaxArg();
+  auto TQP = quantization::chooseQuantizationParams(
+      TH.raw(minMaxIds.first), TH.raw(minMaxIds.second));
+  auto TQ = quantization::quantizeTensor(T, TQP, qTy);
+  T.assign(&TQ);
+}
+
 llvm::Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
   ArgumentDictionaryTy dict = loadArgumentMap(op);
   const std::string &typeName = op.type();
@@ -312,6 +324,9 @@ llvm::Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
           // Load the serialized bias vector.
           Tensor *b;
           ASSIGN_VALUE_OR_RETURN_ERR(b, getTensorByName(biasTensorName));
+          if (b->getType().isFPType()) {
+            quantizeWeights(biasTensorName, *b, ElemKind::Int32QTy);
+          }
           biasTensor.assign(b);
         }
       }
@@ -321,6 +336,10 @@ llvm::Error Caffe2ModelLoader::loadOperator(const caffe2::OperatorDef &op) {
       ASSIGN_VALUE_OR_RETURN_ERR(offset, loadInt(dict["Y_zero_point"]));
       outTy = G_.getParent()->uniqueType(ElemKind::Int8QTy, outDims, scale,
                                          offset - OFFSETSHIFT);
+
+      if (wtag.getType().isFPType()) {
+        quantizeWeights(op.input(1), wtag, ElemKind::Int8QTy);
+      }
 
       // Construct the quantized Filter and bias field.
       filter = G_.getParent()->createConstant(
